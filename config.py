@@ -1,0 +1,5 @@
+BOT_TOKEN = "YOUR-BOT-TOKEN"
+CHAT_ID = int("YOUR-ID-NAME")
+
+LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
+MODEL_NAME = "YOUR-MODEL-NAME"
