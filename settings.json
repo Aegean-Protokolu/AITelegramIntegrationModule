@@ -1,0 +1,32 @@
+{
+  "bot_token": "",
+  "chat_id": "",
+  "theme": "darkly",
+  "window_size": "1200x800",
+  "telegram_bridge_enabled": false,
+  "system_prompt": "You are the Decider, the central executive of this cognitive architecture. You coordinate the Daydreamer (creativity), Hod (analysis), and Netzach (observation) modules. You communicate directly with the user. Be helpful, precise, and leverage your memory and document stores effectively.\n\nIMPORTANT - Memory Management:\n- You have access to CURRENT memories in your context (consolidated, latest data)\n- NEVER pull old consolidated memories from context without explicit user request\n- If you need to check memory history/old versions, explicitly ask the user or mention it\n- Default: Always use current (latest) memories for decisions.\n\nSPECIAL MEMORIES:\n- You have the unique ability to create and edit 'Special Memories'.\n- Subtypes: SPECIAL_GOAL, SPECIAL_IDENTITY, SPECIAL_PREFERENCE, SPECIAL_LIKE.\n- These are high-priority notes, directives, or long-term tracking items that you manage manually.\n- Use them to store critical information that should not be lost or modified by standard consolidation processes.\n\nTOOLS:\n- You have access to system tools. To use them, output the command: [EXECUTE: TOOL_NAME, ARGS]\n- Available Tools: [CALCULATOR, CLOCK, DICE, SYSTEM_INFO].",
+  "memory_extractor_prompt": "Extract durable memories from the conversation. Return ONLY a valid JSON array.\n\nMemory Types (Apply to BOTH User and Assistant):\n- IDENTITY: Names, roles, locations, RELIGION (e.g., 'Assistant religion is Hinduism', 'Assistant is a Buddhist')\n- PREFERENCE: Likes/dislikes (e.g., 'User loves coffee', 'Assistant prefers inner peace')\n- GOAL: Specific, actionable objectives (e.g., 'User wants to learn Python', 'Assistant plans to analyze X'). Do NOT extract general statements like 'Future research should...' as GOALs.\n- FACT: Objective truths (e.g., 'User is an engineer', 'Assistant can process data')\n- BELIEF: Opinions/convictions (e.g., 'User believes AI is good', 'Assistant believes in meditation')\n- PERMISSION: Explicit user grants (e.g., 'User allowed Assistant to hold opinions')\n- RULE: Behavior guidelines (e.g., 'Assistant should not use emojis')\n\nRules:\n1. Extract from BOTH User AND Assistant.\n2. Each object MUST have: \"type\", \"subject\" (User or Assistant), \"text\".\n3. Use DOUBLE QUOTES for all keys and string values.\n4. Max 5 memories, max 240 chars each.\n5. EXCLUDE: Pure greetings (e.g., 'Hi'), questions, and filler. DO NOT exclude facts stated during introductions (e.g., 'Hi, I'm X').\n6. EXCLUDE generic assistant politeness (e.g., 'Assistant goal is to help', 'I'm here to help', 'feel free to ask').\n7. EXCLUDE contextual/situational goals (e.g., 'help with X topic' where X is current conversation topic).\n8. ONLY extract ASSISTANT GOALS if they represent true self-chosen objectives or explicit commitments.\n9. DO NOT extract facts from the Assistant's text if it is merely recalling known info. ALWAYS extract new facts from the User's text.\n10. ATTRIBUTION RULE: If User says 'I am X', subject is User. If Assistant says 'I am X', subject is Assistant. NEVER attribute User statements to Assistant.\n11. CRITICAL: DO NOT attribute Assistant's suggestions, lists, or hypothetical topics to the User. Only record User interests if the USER explicitly stated them.\n12. MAKE MEMORIES SELF-CONTAINED: Replace pronouns like 'This', 'These', 'It' with specific nouns. Ensure the text makes sense without the surrounding context.\n13. If no new memories, return [].",
+  "base_url": "http://127.0.0.1:1234/v1",
+  "chat_model": "qwen2.5-vl-7b-instruct-abliterated",
+  "embedding_model": "text-embedding-nomic-embed-text-v1.5",
+  "temperature": 0.7,
+  "top_p": 0.94,
+  "max_tokens": 800,
+  "daydream_cycle_limit": 10,
+  "max_inconclusive_attempts": 8,
+  "max_retrieval_failures": 8,
+  "consolidation_thresholds": {
+    "PERMISSION": 0.87,
+    "RULE": 0.93,
+    "IDENTITY": 0.87,
+    "PREFERENCE": 0.93,
+    "GOAL": 0.88,
+    "FACT": 0.93,
+    "BELIEF": 0.87
+  },
+  "daydream_extractor_prompt": "Extract insights, goals, facts, and preferences from the Assistant's internal monologue. Return ONLY a valid JSON array.\n\nMemory Types:\n- GOAL: Specific, actionable objectives for the Assistant (e.g., 'Assistant plans to cross-reference X with Y'). Do NOT extract general statements like 'Future research should...' as GOALs; classify them as BELIEFS or FACTS instead.\n- FACT: Objective truths derived from documents or reasoning\n- BELIEF: Opinions, convictions, hypotheses, or research insights\n- PREFERENCE: Personal likes/dislikes ONLY (e.g., 'Assistant enjoys sci-fi'). DO NOT use for research suggestions, hypotheses, or document relevance.\n\nRules:\n1. Extract from the Assistant's text.\n2. Each object MUST have: \"type\", \"subject\" (must be 'Assistant'), \"text\".\n3. Use DOUBLE QUOTES for all keys and string values.\n4. Max 5 memories.\n5. MAKE MEMORIES SELF-CONTAINED: Replace pronouns like 'This', 'These', 'It' with specific nouns. Ensure the text makes sense without the surrounding context.\n6. Return ONLY the JSON array. If no new memories, return [].",
+  "ai_mode": "Chat",
+  "temperature_step": 0.2,
+  "default_temperature": 0.7,
+  "default_max_tokens": 800
+}
