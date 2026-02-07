@@ -20,22 +20,42 @@ Meta-Memory: Automatically creates meta-memories when consolidation happens
 """
 
 import time
-from typing import List, Dict, Optional
+import json
+from typing import List, Dict, Optional, Callable
 from datetime import datetime
+import re
+import random
 
 from memory import MemoryStore
 from meta_memory import MetaMemoryStore
-from lm import compute_embedding
+from lm import compute_embedding, run_local_lm
 import numpy as np
 
 
 class MemoryConsolidator:
     """Consolidates similar/duplicate memories to keep memory store clean."""
 
-    def __init__(self, memory_store: MemoryStore, meta_memory_store: Optional[MetaMemoryStore] = None, similarity_threshold: float = 0.85):
+    def __init__(self, memory_store: MemoryStore, meta_memory_store: Optional[MetaMemoryStore] = None, document_store=None, 
+                 consolidation_thresholds: Optional[Dict[str, float]] = None,
+                 max_inconclusive_attempts: int = 8,
+                 max_retrieval_failures: int = 8,
+                 log_fn: Callable[[str], None] = print):
         self.memory_store = memory_store
         self.meta_memory_store = meta_memory_store
-        self.similarity_threshold = similarity_threshold
+        self.document_store = document_store
+        self.log = log_fn
+        
+        self.consolidation_thresholds = consolidation_thresholds or {
+            "GOAL": 0.88,
+            "IDENTITY": 0.87,
+            "BELIEF": 0.87,
+            "PERMISSION": 0.87,
+            "FACT": 0.93,
+            "PREFERENCE": 0.93,
+            "RULE": 0.93
+        }
+        self.max_inconclusive_attempts = max_inconclusive_attempts
+        self.max_retrieval_failures = max_retrieval_failures
 
     def consolidate(self, time_window_hours: Optional[int] = None) -> Dict[str, int]:
         """
@@ -55,7 +75,7 @@ class MemoryConsolidator:
             recent_memories = self._get_all_memories()
 
         if not recent_memories:
-            print("🧠 [Consolidator] No memories to consolidate")
+            self.log("🧠 [Consolidator] No memories to consolidate")
             return stats
 
         # Sort all memories chronologically
@@ -91,6 +111,7 @@ class MemoryConsolidator:
         groups_by_type = {}
         for mem in recent_memories:
             if mem['id'] in identity_consolidated_ids: continue
+            if mem['type'] == 'NOTE': continue  # Skip Assistant Notes
             key = (mem['subject'], mem['type'])
             if key not in groups_by_type: groups_by_type[key] = []
             groups_by_type[key].append(mem)
@@ -99,34 +120,65 @@ class MemoryConsolidator:
             stats['processed'] += 1
             if len(group) < 2: continue
 
-            for i in range(len(group)):
-                old = group[i]
-                # Skip if already consolidated or if it already has a parent (avoid flattening)
-                if old['id'] in identity_consolidated_ids or old['parent_id'] is not None: 
+            # Prepare data for vectorized calculation
+            valid_items = []
+            embeddings = []
+            
+            for mem in group:
+                # Skip if already consolidated or if it already has a parent
+                if mem['id'] in identity_consolidated_ids or mem['parent_id'] is not None:
                     continue
                 
-                old_emb = None
-                for j in range(i + 1, len(group)):
-                    new = group[j]
-                    # Skip if already consolidated or if it already has a parent
-                    if new['id'] in identity_consolidated_ids: 
+                emb = mem.get('embedding')
+                if emb is None:
+                    emb = compute_embedding(mem['text'])
+                    # Self-healing: Save this embedding so we don't compute it again
+                    self._update_embedding(mem['id'], emb)
+                
+                if emb is not None:
+                    valid_items.append(mem)
+                    embeddings.append(np.array(emb))
+            
+            if len(embeddings) < 2:
+                continue
+
+            # Vectorized Cosine Similarity: Sim = (A . B.T) / (|A| * |B|)
+            # 1. Stack embeddings into matrix (N x D)
+            matrix = np.stack(embeddings)
+            
+            # 2. Normalize rows (L2 norm)
+            norm = np.linalg.norm(matrix, axis=1, keepdims=True)
+            matrix_normalized = matrix / (norm + 1e-10) # Avoid div by zero
+            
+            # 3. Compute Similarity Matrix (N x N)
+            sim_matrix = np.dot(matrix_normalized, matrix_normalized.T)
+            
+            # 4. Iterate upper triangle
+            count = len(valid_items)
+            for r in range(count):
+                old = valid_items[r]
+                if old['id'] in identity_consolidated_ids: continue
+
+                # Determine threshold
+                is_identity_like = "name is" in old['text'].lower() or "lives in" in old['text'].lower()
+                lookup_type = old['type']
+                if is_identity_like:
+                    lookup_type = 'IDENTITY'
+                threshold = self.consolidation_thresholds.get(lookup_type, 0.93)
+
+                for c in range(r + 1, count):
+                    new = valid_items[c]
+                    if new['id'] in identity_consolidated_ids: continue
+
+                    similarity = float(sim_matrix[r, c])
+
+                    # Check cache for previous rejections to avoid re-logging
+                    # (Optional optimization, but matrix calc is fast enough now)
+                    # We still check it to respect historical "distinct" decisions if logic changes
+                    cached_sim = self.memory_store.get_comparison_similarity(old['id'], new['id'])
+                    if cached_sim is not None and cached_sim < threshold and similarity < threshold:
                         continue
 
-                    if old_emb is None: old_emb = compute_embedding(old['text'])
-                    new_emb = compute_embedding(new['text'])
-                    similarity = self._cosine_similarity(old_emb, new_emb)
-                    
-                    # Dynamic threshold based on memory type
-                    # GOAL types: more aggressive consolidation (generic "help with X" statements)
-                    # IDENTITY/BELIEF: moderate consolidation (handle duplicates/expansions)
-                    # Others: conservative (preserve unique information)
-                    if old['type'] == 'GOAL':
-                        threshold = 0.88
-                    elif old['type'] in ('IDENTITY', 'BELIEF', 'PERMISSION'):
-                        threshold = 0.87  # Lowered to catch 0.88-0.89 similarities
-                    else:
-                        threshold = 0.93  # Conservative for FACT/PREFERENCE/RULE
-                    
                     # Special case: IDENTITY substring containment
                     # If one identity is a substring expansion of another, consolidate
                     is_substring_expansion = False
@@ -142,7 +194,7 @@ class MemoryConsolidator:
                         if old_normalized != new_normalized:
                             if old_normalized in new_normalized or new_normalized in old_normalized:
                                 is_substring_expansion = True
-                                print(f"      🔍 Substring match: '{old_value[:50]}' ⊂ '{new_value[:50]}'")
+                                self.log(f"      🔍 Substring match: '{old_value[:50]}' ⊂ '{new_value[:50]}'")
                     
                     # Also check BELIEF substring (e.g., "believes in Islam" vs "believes in Islam and...")
                     if old['type'] == 'BELIEF' and old['subject'] == new['subject']:
@@ -155,13 +207,13 @@ class MemoryConsolidator:
                         if old_normalized != new_normalized:
                             if old_normalized in new_normalized or new_normalized in old_normalized:
                                 is_substring_expansion = True
-                                print(f"      🔍 Substring match: '{old_value[:50]}' ⊂ '{new_value[:50]}'")
+                                self.log(f"      🔍 Substring match: '{old_value[:50]}' ⊂ '{new_value[:50]}'")
                     
                     # Debug output
                     if old['type'] in ('IDENTITY', 'BELIEF', 'PERMISSION') and similarity > 0.85:
-                        print(f"      🔍 Comparing {old['type']}: similarity={similarity:.3f}, threshold={threshold:.3f}, substring={is_substring_expansion}")
-                        print(f"         OLD: {old['text'][:60]}")
-                        print(f"         NEW: {new['text'][:60]}")
+                        self.log(f"      🔍 Comparing {old['type']}: similarity={similarity:.3f}, threshold={threshold:.3f}, substring={is_substring_expansion}")
+                        self.log(f"         OLD: {old['text'][:60]}")
+                        self.log(f"         NEW: {new['text'][:60]}")
                     
                     if similarity >= threshold or is_substring_expansion:
                         if self._mark_consolidated(old['id'], new['id']):
@@ -170,7 +222,253 @@ class MemoryConsolidator:
                             if self.meta_memory_store:
                                 self._create_meta_memory(old, new, "SIMILARITY_LINK")
                             break
+                    else:
+                        # Record comparison to avoid re-checking next time
+                        # Only record if similarity is high enough (> 0.8) to be worth caching/logging
+                        if similarity > 0.8:
+                            self.memory_store.record_comparison(old['id'], new['id'], similarity)
         return stats
+
+    def verify_sources(self, batch_size: int = 5, stop_check_fn: Optional[Callable[[], bool]] = None) -> int:
+        """
+        Verify memories against their cited sources.
+        Removes memories that are not supported by the source document.
+        Also removes memories that reference documents without citation.
+        """
+        if not self.document_store:
+            return 0
+            
+        # Get all active memories
+        all_memories = self._get_all_memories()
+        
+        removed_count = 0
+
+        # 1. Cleanup: Remove memories that refer to documents but lack citation
+        # Includes BELIEF here because uncited beliefs about documents are also invalid
+        cleanup_types = {"GOAL", "FACT", "BELIEF"}
+        uncited_candidates = [
+            m for m in all_memories
+            if "[Source:" not in m['text'] and "[Supported by" not in m['text'] and m['type'] in cleanup_types and m.get('source') == 'daydream'
+        ]
+        
+        triggers = ["the document", "this document", "the study", "this study", "the research", "this research", 
+                    "the pdf", "this pdf", "the findings", "these findings", "the article", "this article", "the text"]
+        
+        for mem in uncited_candidates:
+            if stop_check_fn and stop_check_fn():
+                break
+                
+            lower_text = mem['text'].lower()
+            if any(t in lower_text for t in triggers):
+                self.log(f"❌ [Verifier] Removing uncited document reference ID {mem['id']}: '{mem['text'][:50]}...'")
+                if self.memory_store.delete_entry(mem['id']):
+                    removed_count += 1
+                    if self.meta_memory_store:
+                        self.meta_memory_store.add_meta_memory("CORRECTION", mem['type'], mem['subject'], f"Deleted uncited document reference: '{mem['text']}'", old_id=mem['id'], metadata={'reason': 'uncited_document_reference'})
+
+        # 2. Verify cited memories
+        # Filter for those with a source citation AND allowed types
+        # Including BELIEF to ensure groundedness (beliefs with sources must be supported by them)
+        target_types = {"GOAL", "FACT", "BELIEF"}
+        candidates = [
+            m for m in all_memories 
+            if ("[Source:" in m['text'] or "[Supported by" in m['text']) and m['type'] in target_types and not m.get('verified') and m.get('source') == 'daydream'
+        ]
+        
+        if not candidates and removed_count == 0:
+            return removed_count
+            
+        # Pick a random batch to verify (spreads load over time)
+        batch = random.sample(candidates, min(len(candidates), batch_size))
+        
+        self.log(f"🧹 [Verifier] Found {len(candidates)} unverified candidates. Checking {len(batch)} of them...")
+
+        # Optimization: Sort by source to maximize cache hits
+        batch.sort(key=lambda m: re.search(r"\[(?:Source|Supported by): (.*?)\]", m['text']).group(1) if re.search(r"\[(?:Source|Supported by): (.*?)\]", m['text']) else "")
+        
+        current_doc_cache = {'filename': None, 'id': None, 'chunk_map': None}
+
+        for mem in batch:
+            if stop_check_fn and stop_check_fn():
+                self.log("🛑 [Verifier] Verification stopped by user.")
+                break
+
+            # Double-check verification status (in case of race conditions)
+            with self.memory_store._connect() as con:
+                row = con.execute("SELECT verified FROM memories WHERE id = ?", (mem['id'],)).fetchone()
+                if row and row[0] == 1:
+                    self.log(f"⏩ [Verifier] Memory {mem['id']} already verified. Skipping.")
+                    continue
+
+            # Extract filename
+            match = re.search(r"\[(?:Source|Supported by): (.*?)\]", mem['text'])
+            if not match:
+                continue
+                
+            filename = match.group(1)
+            
+            self.log(f"🔍 [Verifier] Checking Memory {mem['id']} against source '{filename}'...")
+            
+            # Optimization: Cache document chunks to avoid repeated DB fetches
+            if current_doc_cache['filename'] != filename:
+                doc_id = self.document_store.get_document_by_filename(filename)
+                if not doc_id:
+                    current_doc_cache = {'filename': None, 'id': None, 'chunk_map': None}
+                    continue
+                
+                # Fetch chunks for context reconstruction
+                all_chunks = self.document_store.get_document_chunks(doc_id, include_embeddings=False)
+                chunk_map = {c['chunk_index']: c['text'] for c in all_chunks}
+
+                current_doc_cache = {
+                    'filename': filename,
+                    'id': doc_id,
+                    'chunk_map': chunk_map
+                }
+            
+            if not current_doc_cache['id']:
+                continue
+                
+            # Clean text for search (remove source tag)
+            clean_text = mem['text'].replace(match.group(0), "").strip()
+            if not clean_text:
+                continue
+                
+            # Search chunks in that document using the memory's content
+            query_emb = compute_embedding(clean_text)
+
+            # Use optimized local search in document store
+            search_results = self.document_store.search_chunks(query_emb, top_k=5, document_id=current_doc_cache['id'])
+            
+            # Fallback: Cross-Lingual / Keyword Search Generation
+            # If results are poor (e.g. top similarity < 0.45), try to generate a better query
+            # This handles the English Memory -> Turkish Doc gap
+            if not search_results or (search_results and search_results[0]['similarity'] < 0.45):
+                self.log(f"⚠️ [Verifier] Low similarity ({search_results[0]['similarity'] if search_results else 0:.2f}) for direct search. Attempting cross-lingual query generation...")
+                
+                gen_prompt = (
+                    f"I need to find evidence for this claim in a document named '{filename}'.\n"
+                    f"Claim: {clean_text}\n"
+                    "The document might be in a different language (e.g., Turkish, Spanish) or use different terminology.\n"
+                    "Generate a search query (keywords or translated sentence) that is most likely to match the raw text in the document.\n"
+                    "Output ONLY the search query text."
+                )
+                
+                better_query = run_local_lm([{"role": "user", "content": gen_prompt}], temperature=0.1, max_tokens=100).strip()
+                
+                if better_query and better_query != clean_text:
+                    self.log(f"🔍 [Verifier] Retrying search with generated query: '{better_query}'")
+                    query_emb_2 = compute_embedding(better_query)
+                    search_results_2 = self.document_store.search_chunks(query_emb_2, top_k=5, document_id=current_doc_cache['id'])
+                    
+                    if search_results_2:
+                        search_results = search_results_2 # Prefer the generated query results
+
+            if not search_results:
+                self.log(f"⚠️ [Verifier] No relevant text chunks found in '{filename}' for Memory {mem['id']}.")
+                
+                # Increment attempts and check limit
+                attempts = self.memory_store.increment_verification_attempts(mem['id'])
+                if attempts >= self.max_retrieval_failures:
+                    self.log(f"❌ [Verifier] Memory {mem['id']} deleted after {self.max_retrieval_failures} failed retrieval attempts.")
+                    if self.memory_store.delete_entry(mem['id']):
+                        removed_count += 1
+                        if self.meta_memory_store:
+                            self.meta_memory_store.add_meta_memory("CORRECTION", mem['type'], mem['subject'], f"Deleted memory after {self.max_retrieval_failures} failed retrievals: '{clean_text}'", old_id=mem['id'], metadata={'reason': 'retrieval_failure_limit_reached', 'attempts': attempts})
+                continue
+
+            # Context Expansion: Get surrounding chunks to "read" the document section
+            chunk_map = current_doc_cache['chunk_map']
+            
+            relevant_indices = set()
+            MAX_CHARS = 4000  # Reduced limit to avoid 400 Bad Request
+            current_chars = 0
+
+            for res in search_results:
+                # Stop adding chunks if we exceed the limit
+                if current_chars >= MAX_CHARS:
+                    break
+
+                idx = res['chunk_index']
+                # Add window of +/- 1 chunk to provide context
+                for i in range(idx - 1, idx + 2):
+                    if i in chunk_map:
+                        if i not in relevant_indices:
+                            # Check length before adding
+                            chunk_len = len(chunk_map[i])
+                            if current_chars + chunk_len < MAX_CHARS:
+                                relevant_indices.add(i)
+                                current_chars += chunk_len
+            
+            sorted_indices = sorted(list(relevant_indices))
+            
+            # Reconstruct text flow with separators for non-contiguous sections
+            context_parts = []
+            last_idx = -999
+            for idx in sorted_indices:
+                if idx > last_idx + 1:
+                    context_parts.append("\n... [Skipped sections] ...\n")
+                context_parts.append(f"[Section {idx}] {chunk_map[idx]}")
+                last_idx = idx
+                
+            context_text = "\n".join(context_parts)
+            
+            # Verify with LLM
+            prompt = (
+                "You are a fact-checker verifying if a memory is supported by a source document.\n"
+                "Note: The Document Excerpts and the Memory Claim might be in DIFFERENT LANGUAGES.\n"
+                "Verify based on meaning, not just keyword matching.\n\n"
+                f"Excerpts from '{filename}':\n{context_text}\n\n"
+                f"Memory Claim: {clean_text}\n\n"
+                "Task: Analyze if the Memory Claim is supported by the text.\n"
+                "1. Briefly analyze the relationship between the text and the claim.\n"
+                "2. Allow for reasonable inference, synthesis, and summarization. It does not need to be verbatim.\n"
+                "3. Only reject if the claim clearly contradicts the text or is completely unrelated/hallucinated.\n\n"
+                "Output format:\n"
+                "Reasoning: <short analysis>\n"
+                "Verdict: VALID or INVALID"
+            )
+            
+            response = run_local_lm([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=150)
+            
+            # Robust parsing: look for keywords even if formatting is messy
+            if "Verdict: INVALID" in response or "Verdict:INVALID" in response:
+                self.log(f"❌ [Verifier] Memory {mem['id']} rejected. Claim: '{clean_text[:50]}...' not found in '{filename}'")
+                if self.memory_store.delete_entry(mem['id']):
+                    removed_count += 1
+                    if self.meta_memory_store:
+                        self.meta_memory_store.add_meta_memory("CORRECTION", mem['type'], mem['subject'], f"Deleted hallucinated memory about {filename}: '{clean_text}'", old_id=mem['id'], metadata={'reason': 'invalid_verdict', 'llm_response': response})
+            elif "Verdict: VALID" in response or "Verdict:VALID" in response:
+                self.log(f"✅ [Verifier] Memory {mem['id']} confirmed VALID.")
+                self.memory_store.mark_verified(mem['id'])
+            else:
+                self.log(f"❓ [Verifier] Inconclusive verdict for Memory {mem['id']}. Response: {response[:50]}...")
+                
+                # Increment attempts and check limit
+                attempts = self.memory_store.increment_verification_attempts(mem['id'])
+                if attempts >= self.max_inconclusive_attempts:
+                    self.log(f"❌ [Verifier] Memory {mem['id']} deleted after {self.max_inconclusive_attempts} inconclusive verification attempts.")
+                    if self.memory_store.delete_entry(mem['id']):
+                        removed_count += 1
+                        if self.meta_memory_store:
+                            self.meta_memory_store.add_meta_memory("CORRECTION", mem['type'], mem['subject'], f"Deleted memory after {self.max_inconclusive_attempts} inconclusive verifications: '{clean_text}'", old_id=mem['id'], metadata={'reason': 'inconclusive_limit_reached', 'attempts': attempts})
+
+        return removed_count
+
+    def get_unverified_count(self) -> int:
+        """Get number of unverified memories that require verification."""
+        target_types = ("GOAL", "FACT", "BELIEF")
+        placeholders = ','.join(['?'] * len(target_types))
+        with self.memory_store._connect() as con:
+            row = con.execute(f"""
+                SELECT COUNT(*) FROM memories 
+                WHERE verified = 0 
+                AND (text LIKE '%[Source:%' OR text LIKE '%[Supported by%')
+                AND type IN ({placeholders})
+                AND parent_id IS NULL
+                AND source = 'daydream'
+            """, target_types).fetchone()
+        return row[0] if row else 0
 
     def _consolidate_group(self, group: List[Dict]) -> int:
         """DEPRECATED: Logic moved to main consolidate function."""
@@ -180,7 +478,7 @@ class MemoryConsolidator:
         """Get all memories created after cutoff_time."""
         with self.memory_store._connect() as con:
             rows = con.execute("""
-                SELECT id, identity, parent_id, type, subject, text, confidence, source, created_at
+                SELECT id, identity, parent_id, type, subject, text, confidence, source, created_at, embedding, verified
                 FROM memories
                 WHERE created_at > ?
                 ORDER BY created_at DESC
@@ -198,6 +496,8 @@ class MemoryConsolidator:
                 'confidence': r[6],
                 'source': r[7],
                 'created_at': r[8],
+                'embedding': json.loads(r[9]) if r[9] else None,
+                'verified': r[10] if len(r) > 10 else 0,
             })
         return memories
 
@@ -205,7 +505,7 @@ class MemoryConsolidator:
         """Get ALL memories regardless of age."""
         with self.memory_store._connect() as con:
             rows = con.execute("""
-                SELECT id, identity, parent_id, type, subject, text, confidence, source, created_at
+                SELECT id, identity, parent_id, type, subject, text, confidence, source, created_at, embedding, verified
                 FROM memories
                 ORDER BY created_at DESC
             """).fetchall()
@@ -222,6 +522,8 @@ class MemoryConsolidator:
                 'confidence': r[6],
                 'source': r[7],
                 'created_at': r[8],
+                'embedding': json.loads(r[9]) if r[9] else None,
+                'verified': r[10] if len(r) > 10 else 0,
             })
         return memories
 
@@ -255,12 +557,22 @@ class MemoryConsolidator:
                         (new_id, old_id)
                     )
                     con.commit()
-                    print(f"      🔗 Updated parent_id: ID {old_id} now points to ID {new_id}")
+                    self.log(f"      🔗 Updated parent_id: ID {old_id} now points to ID {new_id}")
                     return True
                 else:
                     # Already consolidated
                     return False
             return False
+
+    def _update_embedding(self, memory_id: int, embedding: np.ndarray) -> None:
+        """Update the embedding for a specific memory ID."""
+        try:
+            embedding_json = json.dumps(embedding.tolist())
+            with self.memory_store._connect() as con:
+                con.execute("UPDATE memories SET embedding = ? WHERE id = ?", (embedding_json, memory_id))
+                con.commit()
+        except Exception as e:
+            self.log(f"⚠️ Failed to update embedding for memory {memory_id}: {e}")
 
     def _create_meta_memory(self, old_mem: Dict, new_mem: Dict, event_type: str) -> None:
         """
@@ -346,14 +658,14 @@ class MemoryConsolidator:
             metadata=metadata
         )
 
-        print(f"      🧠 Meta-memory created: {meta_text}")
+        self.log(f"      🧠 Meta-memory created: {meta_text}")
 
     @staticmethod
     def _extract_value_from_text(text: str) -> str:
         """
         Extract the actual value from memory text.
         Example: "Assistant name is Ada" → "Ada"
-        Example: "User lives in Türkiye" → "Türkiye"
+        Example: "User lives in Van, Türkiye" → "Van, Türkiye"
         """
         text = text.strip()
 
